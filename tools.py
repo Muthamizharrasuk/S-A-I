@@ -25,6 +25,13 @@ def _load(path: Path) -> list:
 def _save(path: Path, data: list):
     path.write_text(json.dumps(data, indent=2))
 
+def _run_applescript(script: str) -> str:
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True, text=True
+    )
+    return result.stdout.strip()
+
 
 # ── tools ─────────────────────────────────────
 
@@ -37,7 +44,6 @@ def set_reminder(task: str, when: str) -> str:
     script = f'tell application "Reminders" to make new reminder with properties {{name:"{task}"}}'
     subprocess.run(["osascript", "-e", script])
     due = parsed.strftime("%b %d at %I:%M %p") if parsed else when
-    # also log locally
     reminders = _load(REMINDERS_FILE)
     reminders.append({
         "id":      len(reminders) + 1,
@@ -136,6 +142,111 @@ def web_search(query: str) -> str:
     )
 
 
+def get_contacts(search: str = "") -> str:
+    """
+    Reads contacts from the Mac Contacts app via AppleScript.
+    Optional search filters by name. Returns name + phone numbers.
+    """
+    if search:
+        script = f'''
+tell application "Contacts"
+    set matchingPeople to every person whose name contains "{search}"
+    set result to ""
+    repeat with p in matchingPeople
+        set pName to name of p
+        set pPhones to phones of p
+        set phoneList to ""
+        repeat with ph in pPhones
+            set phoneList to phoneList & (value of ph) & " "
+        end repeat
+        set result to result & pName & ": " & phoneList & "\\n"
+    end repeat
+    return result
+end tell
+'''
+    else:
+        script = '''
+tell application "Contacts"
+    set result to ""
+    repeat with p in every person
+        set pName to name of p
+        set pPhones to phones of p
+        set phoneList to ""
+        repeat with ph in pPhones
+            set phoneList to phoneList & (value of ph) & " "
+        end repeat
+        set result to result & pName & ": " & phoneList & "\\n"
+    end repeat
+    return result
+end tell
+'''
+    output = _run_applescript(script)
+    if not output:
+        return "No contacts found. Check System Settings → Privacy & Security → Automation and allow Contacts access."
+    return f"Contacts:\n{output}"
+
+
+def get_recent_messages(contact: str, count: int = 5) -> str:
+    script = f'''
+tell application "Messages"
+    set targetBuddy to "{contact}"
+    set allMessages to {{}}
+    repeat with aChat in chats
+        try
+            set chatParticipants to participants of aChat
+            repeat with p in chatParticipants
+                if (handle of p) contains targetBuddy or (full name of p) contains targetBuddy then
+                    set msgList to messages of aChat
+                    set msgCount to count of msgList
+                    set startIdx to msgCount - {count} + 1
+                    if startIdx < 1 then set startIdx to 1
+                    repeat with i from startIdx to msgCount
+                        set aMsg to item i of msgList
+                        set msgText to text of aMsg
+                        set msgDate to date string of (date sent of aMsg)
+                        set allMessages to allMessages & {{msgDate & ": " & msgText}}
+                    end repeat
+                end if
+            end repeat
+        end try
+    end repeat
+    return allMessages
+end tell
+'''
+    output = _run_applescript(script)
+    if not output:
+        return f"No messages found with '{contact}'."
+    return f"Recent messages with {contact}:\n{output}"
+
+
+def send_message(contact: str, message: str) -> str:
+    """
+    Looks up the contact first, shows a preview, asks for confirmation.
+    SAI never sends without explicit yes from the user.
+    """
+    # Look up contact info first so we know we have the right person
+    contact_info = get_contacts(search=contact)
+
+    print(f"\n⚠️  SAI wants to send this iMessage:")
+    print(f"   To:      {contact}")
+    print(f"   Info:    {contact_info[:300]}")
+    print(f"   Message: {message}")
+    confirm = input("\n   Confirm send? (yes/no): ").strip().lower()
+
+    if confirm not in ("yes", "y"):
+        return f"❌ Message to {contact} cancelled — not sent."
+
+    script = f'''
+tell application "Messages"
+    set targetService to 1st service whose service type = iMessage
+    set targetBuddy to buddy "{contact}" of targetService
+    send "{message}" to targetBuddy
+end tell
+'''
+    subprocess.run(["osascript", "-e", script])
+    return f"✅ iMessage sent to {contact}: '{message}'"
+
+
 # ── dispatcher ───────────────────────────────
 TOOL_FUNCTIONS = {
     "get_current_datetime":   lambda args: get_current_datetime(),
@@ -149,6 +260,9 @@ TOOL_FUNCTIONS = {
     "generate_project_ideas": lambda args: generate_project_ideas(**args),
     "analyse_project":        lambda args: analyse_project(**args),
     "web_search":             lambda args: web_search(**args),
+    "get_contacts":           lambda args: get_contacts(**args),
+    "get_recent_messages":    lambda args: get_recent_messages(**args),
+    "send_message":           lambda args: send_message(**args),
 }
 
 def dispatch(tool_name: str, args: dict) -> str:
@@ -302,6 +416,65 @@ TOOL_SCHEMAS = [
                     "query": {"type": "string"},
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_contacts",
+            "description": "Search your Mac Contacts app by name to get phone numbers and contact details. Use this before sending a message to find the right person.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search": {
+                        "type": "string",
+                        "description": "Name to search for e.g. 'Pranav'. Leave empty to list all contacts.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_recent_messages",
+            "description": "Read recent iMessages from a contact. Use when the user asks what someone said or if someone replied.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "contact": {
+                        "type": "string",
+                        "description": "Contact name or phone number as it appears in Messages.",
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "How many recent messages to retrieve. Default 5.",
+                    },
+                },
+                "required": ["contact"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Send an iMessage to a contact. Always asks the user for confirmation before sending. Use get_contacts first to find the right name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "contact": {
+                        "type": "string",
+                        "description": "Contact name exactly as it appears in the Contacts app.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The message text to send.",
+                    },
+                },
+                "required": ["contact", "message"],
             },
         },
     },

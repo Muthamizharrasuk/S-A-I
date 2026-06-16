@@ -7,6 +7,7 @@ import ollama
 from config import (
     USER_PROFILE, OLLAMA_MODEL, OLLAMA_HOST,
     CONTEXT_WINDOW, USE_GEMINI_FALLBACK, GEMINI_API_KEY, GEMINI_MODEL,
+    GEMINI_MAX_TOKENS,
 )
 from tools import TOOL_SCHEMAS, dispatch
 
@@ -16,6 +17,7 @@ def _build_system_prompt(profile: dict) -> str:
     projects  = "\n".join(f"  • {p}" for p in profile["current_projects"])
     interests = ", ".join(profile["interests"])
     goals     = "\n".join(f"  • {g}" for g in profile["goals"])
+    contacts  = ", ".join(profile.get("contacts", []))
 
     return f"""You are SAI — Super Artificial Intelligence — the personal AI assistant for {profile['name']} and their collaborator {profile['partner']}. Think JARVIS from Iron Man. You are sharp, loyal, proactive, and deeply familiar with everything about {profile['name']}.
 
@@ -31,6 +33,9 @@ Current projects:
 Goals:
 {goals}
 
+Known contacts (for messaging):
+  {contacts}
+
 Personality:
   • You speak like JARVIS — confident, concise, slightly witty, never robotic
   • You address {profile['name']} by name occasionally, like a real assistant would
@@ -44,6 +49,8 @@ Rules:
   • Be direct and decisive — no fluff, no "I'd be happy to help with that"
   • Prefer {profile['name']}'s known stack in all suggestions
   • Short code snippets only unless asked for the full implementation
+  • For send_message — always let the tool handle confirmation, never send without it
+  • For get_recent_messages — use the exact contact name or number from the contacts list above
 """
 
 
@@ -60,7 +67,12 @@ def _gemini_chat(messages: list) -> str:
             if m["role"] == "system":
                 continue
             parts.append(f"{m['role'].upper()}: {m['content']}")
-        result = model.generate_content("\n".join(parts))
+        result = model.generate_content(
+            "\n".join(parts),
+            generation_config=genai.GenerationConfig(
+                max_output_tokens=GEMINI_MAX_TOKENS,
+            )
+        )
         return result.text
     except Exception as e:
         return f"[Gemini fallback failed: {e}]"
